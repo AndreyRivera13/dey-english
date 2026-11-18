@@ -40,7 +40,9 @@ const MODEL_OVERRIDE = params.get('model');
 
 let webllm = null;
 let engine = null;
-let loadedTier = null;
+let loadedTier = null; // solo tiene valor cuando el modelo quedó cargado de verdad
+let lastTier = null;   // último modelo que se pidió, para recargarlo si se pierde
+let activeWorker = null;
 let support = null;
 let queue = Promise.resolve();
 
@@ -74,7 +76,7 @@ export async function detectSupport() {
   }
 }
 
-export const isReady = () => MOCK ? loadedTier !== null : engine !== null;
+export const isReady = () => loadedTier !== null;
 export const currentTier = () => loadedTier;
 
 const modelIdFor = (model, f16) => MODEL_OVERRIDE || (f16 ? model.f16 : model.f32);
@@ -108,10 +110,12 @@ async function createEngine(modelId, initProgressCallback) {
     }, { once: true });
   });
   try {
-    return await Promise.race([
+    const created = await Promise.race([
       webllm.CreateWebWorkerMLCEngine(worker, modelId, { initProgressCallback }),
       workerFailed,
     ]);
+    activeWorker = worker;
+    return created;
   } catch (error) {
     worker.terminate();
     if (error.workerFailed) return direct();
@@ -129,36 +133,70 @@ export async function loadModel(tier, onProgress = () => {}) {
     loadedTier = tier;
     return;
   }
+  const report = (r) => onProgress({ progress: r.progress ?? 0, text: r.text || '' });
+  await enqueue(() => doLoad(tier, report));
+}
+
+async function doLoad(tier, report) {
   const { ok, f16, reason } = await detectSupport();
   if (!ok) throw new Error(reason);
   webllm ??= await import('../vendor/web-llm.js');
   const modelId = modelIdFor(getModel(tier), f16);
-  const report = (r) => onProgress({ progress: r.progress ?? 0, text: r.text || '' });
+  loadedTier = null; // si algo falla de aquí en adelante, no hay modelo activo
+  if (engine) {
+    engine.setInitProgressCallback?.(report);
+    await engine.reload(modelId);
+  } else {
+    engine = await createEngine(modelId, report);
+  }
+  loadedTier = tier;
+  lastTier = tier;
+}
 
-  await enqueue(async () => {
-    if (engine) {
-      engine.setInitProgressCallback?.(report);
-      await engine.reload(modelId);
-    } else {
-      engine = await createEngine(modelId, report);
-    }
-    loadedTier = tier;
-  });
+// Si el modelo se perdió (otra pestaña liberó la GPU, el worker se reinició),
+// se vuelve a cargar desde la caché y se reintenta una vez.
+const isNotLoaded = (error) => /not loaded|ModelNotLoaded|\.reload\(/i.test(String(error?.message || error));
+
+async function recover() {
+  if (!lastTier) throw new Error('El modelo no está cargado. Actívalo desde la pantalla de niveles.');
+  loadedTier = null;
+  try {
+    await doLoad(lastTier, () => {});
+  } catch {
+    // El motor quedó inservible: se descarta y se crea uno nuevo.
+    try { activeWorker?.terminate(); } catch { /* ya estaba cerrado */ }
+    engine = null;
+    activeWorker = null;
+    await doLoad(lastTier, () => {});
+  }
+}
+
+async function withRecovery(run) {
+  if (!loadedTier) await recover();
+  try {
+    return await run();
+  } catch (error) {
+    if (!isNotLoaded(error)) throw error;
+    await recover();
+    return run();
+  }
 }
 
 // Respuesta en streaming para la conversación. Devuelve el texto completo.
 export function chatStream(messages, { onToken = () => {}, temperature = 0.7, maxTokens = 220 } = {}) {
   return enqueue(async () => {
     if (MOCK) return mockStream(messages, onToken);
-    const stream = await engine.chat.completions.create({
-      messages, temperature, max_tokens: maxTokens, stream: true,
+    return withRecovery(async () => {
+      const stream = await engine.chat.completions.create({
+        messages, temperature, max_tokens: maxTokens, stream: true,
+      });
+      let text = '';
+      for await (const chunk of stream) {
+        const piece = chunk.choices[0]?.delta?.content || '';
+        if (piece) { text += piece; onToken(piece, text); }
+      }
+      return text.trim();
     });
-    let text = '';
-    for await (const chunk of stream) {
-      const piece = chunk.choices[0]?.delta?.content || '';
-      if (piece) { text += piece; onToken(piece, text); }
-    }
-    return text.trim();
   });
 }
 
@@ -166,11 +204,13 @@ export function chatStream(messages, { onToken = () => {}, temperature = 0.7, ma
 export function complete(messages, { schema, temperature = 0, maxTokens = 500, kind = '' } = {}) {
   return enqueue(async () => {
     if (MOCK) return mockComplete(messages, kind);
-    const reply = await engine.chat.completions.create({
-      messages, temperature, max_tokens: maxTokens,
-      ...(schema ? { response_format: { type: 'json_object', schema } } : {}),
+    return withRecovery(async () => {
+      const reply = await engine.chat.completions.create({
+        messages, temperature, max_tokens: maxTokens,
+        ...(schema ? { response_format: { type: 'json_object', schema } } : {}),
+      });
+      return reply.choices[0]?.message?.content || '';
     });
-    return reply.choices[0]?.message?.content || '';
   });
 }
 
@@ -180,6 +220,9 @@ export function interrupt() {
 
 export function friendlyError(error) {
   const message = String(error?.message || error);
+  if (/not loaded|ModelNotLoaded/i.test(message)) {
+    return 'El modelo se descargó de la memoria gráfica. Vuelve a Niveles y actívalo de nuevo.';
+  }
   if (/device.*lost|out of memory|OOM|allocation/i.test(message)) {
     return 'El equipo se quedó sin memoria gráfica. Cierra otras pestañas o elige un modelo más liviano.';
   }
