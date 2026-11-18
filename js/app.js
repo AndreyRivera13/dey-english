@@ -103,7 +103,11 @@ async function startLoad(tier) {
     await llm.loadModel(tier, ({ progress, text }) => setModel({ progress, text }));
     setModel({ status: 'ready', choosing: false, cached: { ...model.cached, [tier]: true } });
   } catch (error) {
-    setModel({ status: llm.isReady() ? 'ready' : 'error', choosing: true, error: llm.friendlyError(error) });
+    if (!llm.isReady() && llm.isGpuFailure(error)) {
+      state.tier = llm.lighterTier(tier);
+      persist();
+    }
+    setModel({ status: llm.isReady() ? 'ready' : 'error', choosing: true, pick: state.tier, error: llm.friendlyError(error) });
   }
 }
 
@@ -545,7 +549,9 @@ function viewCall({ level, scenario }) {
       setCaption('', `La IA no pudo responder. ${llm.friendlyError(error)}${advice}`);
       // Sin modelo activo, la pantalla de niveles abre la selección ya apuntando al siguiente más liviano.
       if (!llm.isReady()) {
-        setModel({ status: 'error', choosing: true, pick: llm.lighterTier(state.tier), error: llm.friendlyError(error) });
+        state.tier = llm.lighterTier(state.tier); // la próxima visita ya empieza con el modelo más liviano
+        persist();
+        setModel({ status: 'error', choosing: true, pick: state.tier, error: llm.friendlyError(error) });
       }
       return;
     }
