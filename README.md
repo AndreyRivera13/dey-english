@@ -18,9 +18,12 @@ El modelo de lenguaje corre en el navegador con WebGPU usando [WebLLM](https://g
 
 | Modelo | Descarga aprox. | Memoria gráfica |
 | --- | --- | --- |
-| Ligero (Qwen2.5 1.5B) | 1 GB | 2 GB |
+| Mínimo (Llama 3.2 1B) | 0,7 GB | 1 GB |
+| Ligero (Qwen2.5 1.5B), el modelo por defecto | 1 GB | 2 GB |
 | Equilibrado (Llama 3.2 3B) | 1,8 GB | 3 GB |
 | Máxima calidad (Llama 3.1 8B) | 4,5 GB | 6 GB |
+
+Si la tarjeta gráfica se queda sin memoria (el navegador lo reporta como `Device was lost`), la app descarta el modelo y propone el siguiente más liviano. El contexto se limita a 2048 tokens para gastar menos memoria.
 
 La voz usa las funciones del navegador: `SpeechRecognition` para el dictado y `speechSynthesis` para leer las respuestas.
 

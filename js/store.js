@@ -6,7 +6,7 @@ export const READY_TO_MOVE_UP = 4; // escenarios superados para recomendar el si
 
 export const emptyState = () => ({
   level: 'A1',
-  tier: 'balanced',
+  tier: 'light',
   captions: true,
   voice: true,
   sessions: [], // {date, level, scenarioId, turns, score}

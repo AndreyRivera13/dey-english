@@ -3,13 +3,22 @@
 
 export const MODELS = [
   {
+    tier: 'tiny',
+    name: 'Mínimo',
+    f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',
+    f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC',
+    download: '0,7 GB',
+    memory: '1 GB',
+    note: 'Para equipos con poca memoria gráfica. Conversa, pero corrige menos y se equivoca más.',
+  },
+  {
     tier: 'light',
     name: 'Ligero',
     f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
     f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC',
     download: '1 GB',
     memory: '2 GB',
-    note: 'Para portátiles con gráficos integrados. Conversa bien; la corrección es más básica.',
+    note: 'El punto de partida recomendado: cabe en casi todos los equipos. Conversa bien; la corrección es más básica.',
   },
   {
     tier: 'balanced',
@@ -18,7 +27,7 @@ export const MODELS = [
     f32: 'Llama-3.2-3B-Instruct-q4f32_1-MLC',
     download: '1,8 GB',
     memory: '3 GB',
-    note: 'El punto de partida recomendado para la mayoría de equipos.',
+    note: 'Mejor corrección que Ligero. Pide una tarjeta gráfica con memoria propia.',
   },
   {
     tier: 'best',
@@ -33,6 +42,15 @@ export const MODELS = [
 
 export const getModel = (tier) => MODELS.find((m) => m.tier === tier) || MODELS[1];
 
+// El siguiente modelo más liviano (el mismo si ya es el más pequeño).
+export function lighterTier(tier) {
+  const i = MODELS.findIndex((m) => m.tier === tier);
+  return MODELS[Math.max(0, i - 1)].tier;
+}
+
+// Un contexto de 2048 tokens sobra para estas conversaciones y gasta menos memoria gráfica.
+const CHAT_OPTS = { context_window_size: 2048 };
+
 const params = new URLSearchParams(globalThis.location?.search || '');
 export const MOCK = params.has('mock');
 // ?model=<id de WebLLM> permite probar cualquier otro modelo de su catálogo.
@@ -43,6 +61,7 @@ let engine = null;
 let loadedTier = null; // solo tiene valor cuando el modelo quedó cargado de verdad
 let lastTier = null;   // último modelo que se pidió, para recargarlo si se pierde
 let activeWorker = null;
+let gpuDead = false; // la tarjeta gráfica perdió el dispositivo y el motor se descartó
 let support = null;
 let queue = Promise.resolve();
 
@@ -95,7 +114,7 @@ export async function isDownloaded(tier) {
 
 async function createEngine(modelId, initProgressCallback) {
   // Primero en un worker; si el navegador no lo permite, en el hilo principal.
-  const direct = () => webllm.CreateMLCEngine(modelId, { initProgressCallback });
+  const direct = () => webllm.CreateMLCEngine(modelId, { initProgressCallback }, CHAT_OPTS);
   let worker;
   try {
     worker = new Worker(new URL('./llm-worker.js', import.meta.url), { type: 'module' });
@@ -111,7 +130,7 @@ async function createEngine(modelId, initProgressCallback) {
   });
   try {
     const created = await Promise.race([
-      webllm.CreateWebWorkerMLCEngine(worker, modelId, { initProgressCallback }),
+      webllm.CreateWebWorkerMLCEngine(worker, modelId, { initProgressCallback }, CHAT_OPTS),
       workerFailed,
     ]);
     activeWorker = worker;
@@ -137,38 +156,48 @@ export async function loadModel(tier, onProgress = () => {}) {
   await enqueue(() => doLoad(tier, report));
 }
 
+// Pérdida del dispositivo gráfico: casi siempre es falta de memoria. Con el dispositivo
+// perdido el motor no sirve para nada más, así que se descarta.
+export const isGpuFailure = (error) =>
+  /device.*lost|GPUDeviceLost|already been disposed|out of memory|\bOOM\b/i.test(String(error?.message || error));
+
+function dropEngine() {
+  try { activeWorker?.terminate(); } catch { /* ya estaba cerrado */ }
+  engine = null;
+  activeWorker = null;
+  loadedTier = null;
+}
+
 async function doLoad(tier, report) {
   const { ok, f16, reason } = await detectSupport();
   if (!ok) throw new Error(reason);
   webllm ??= await import('../vendor/web-llm.js');
   const modelId = modelIdFor(getModel(tier), f16);
   loadedTier = null; // si algo falla de aquí en adelante, no hay modelo activo
-  if (engine) {
-    engine.setInitProgressCallback?.(report);
-    await engine.reload(modelId);
-  } else {
-    engine = await createEngine(modelId, report);
+  try {
+    if (engine) {
+      engine.setInitProgressCallback?.(report);
+      await engine.reload(modelId, CHAT_OPTS);
+    } else {
+      engine = await createEngine(modelId, report);
+    }
+  } catch (error) {
+    if (isGpuFailure(error)) { dropEngine(); gpuDead = true; }
+    throw error;
   }
   loadedTier = tier;
   lastTier = tier;
+  gpuDead = false;
 }
 
-// Si el modelo se perdió (otra pestaña liberó la GPU, el worker se reinició),
+// Si el modelo se perdió sin que fallara la GPU (otra pestaña, el worker se reinició),
 // se vuelve a cargar desde la caché y se reintenta una vez.
 const isNotLoaded = (error) => /not loaded|ModelNotLoaded|\.reload\(/i.test(String(error?.message || error));
 
 async function recover() {
+  if (gpuDead) throw new Error('Device was lost: la tarjeta gráfica se quedó sin memoria.');
   if (!lastTier) throw new Error('El modelo no está cargado. Actívalo desde la pantalla de niveles.');
-  loadedTier = null;
-  try {
-    await doLoad(lastTier, () => {});
-  } catch {
-    // El motor quedó inservible: se descarta y se crea uno nuevo.
-    try { activeWorker?.terminate(); } catch { /* ya estaba cerrado */ }
-    engine = null;
-    activeWorker = null;
-    await doLoad(lastTier, () => {});
-  }
+  await doLoad(lastTier, () => {});
 }
 
 async function withRecovery(run) {
@@ -176,6 +205,7 @@ async function withRecovery(run) {
   try {
     return await run();
   } catch (error) {
+    if (isGpuFailure(error)) { dropEngine(); gpuDead = true; throw error; }
     if (!isNotLoaded(error)) throw error;
     await recover();
     return run();
@@ -220,11 +250,11 @@ export function interrupt() {
 
 export function friendlyError(error) {
   const message = String(error?.message || error);
+  if (isGpuFailure(error) || /allocation/i.test(message)) {
+    return 'La tarjeta gráfica se quedó sin memoria con este modelo. Elige uno más liviano y cierra otras pestañas que usen la GPU.';
+  }
   if (/not loaded|ModelNotLoaded/i.test(message)) {
     return 'El modelo se descargó de la memoria gráfica. Vuelve a Niveles y actívalo de nuevo.';
-  }
-  if (/device.*lost|out of memory|OOM|allocation/i.test(message)) {
-    return 'El equipo se quedó sin memoria gráfica. Cierra otras pestañas o elige un modelo más liviano.';
   }
   if (/shader-f16|ShaderF16/i.test(message)) {
     return 'Tu tarjeta gráfica no soporta este formato de modelo. Elige otro modelo.';

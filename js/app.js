@@ -130,7 +130,7 @@ function modelPanelContent() {
   return [
     h('div', {},
       h('h3', {}, 'Elige el modelo de IA'),
-      h('p', { class: 'muted small' }, 'Corre en tu equipo, sin cuentas ni pagos. Se descarga una sola vez y queda guardado en este navegador.')),
+      h('p', { class: 'muted small' }, 'Corre en tu equipo, sin cuentas ni pagos. Se descarga una sola vez y queda guardado en este navegador. Si la llamada se corta por memoria, baja a un modelo más liviano.')),
     h('div', { class: 'tiers', role: 'radiogroup', 'aria-label': 'Modelo de IA' }, llm.MODELS.map((m) =>
       h('label', { class: 'tier' },
         h('input', { type: 'radio', name: 'tier', value: m.tier, checked: m.tier === model.pick, onchange: () => setModel({ pick: m.tier }) }),
@@ -541,7 +541,12 @@ function viewCall({ level, scenario }) {
       entry.review = { status: 'skip' };
       drawReview(entry);
       setPhase('waiting');
-      setCaption('', `La IA no pudo responder. ${llm.friendlyError(error)}`);
+      const advice = llm.isReady() ? '' : ' Termina la llamada y activa otro modelo desde Niveles.';
+      setCaption('', `La IA no pudo responder. ${llm.friendlyError(error)}${advice}`);
+      // Sin modelo activo, la pantalla de niveles abre la selección ya apuntando al siguiente más liviano.
+      if (!llm.isReady()) {
+        setModel({ status: 'error', choosing: true, pick: llm.lighterTier(state.tier), error: llm.friendlyError(error) });
+      }
       return;
     }
     call.streaming = false;
